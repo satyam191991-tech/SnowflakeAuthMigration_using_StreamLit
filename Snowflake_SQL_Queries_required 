@@ -1,0 +1,695 @@
+create or replace TABLE WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_STATUS (
+      ACTIVE_SERVICE_USER_NAME VARCHAR(16777216) NOT NULL,
+      AUTHENTICATION_TYPE VARCHAR(16777216),
+      HAS_AWS_SECRET VARCHAR(16777216),
+      NETWORK_POLICY VARCHAR(16777216),
+      INSERTED_AT DATE DEFAULT CURRENT_DATE(),
+      APPLICATION_BEING_USED VARCHAR(16777216),
+      COMMENTS VARCHAR(16777216),
+      primary key (ACTIVE_SERVICE_USER_NAME)
+);
+
+select * from WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_STATUS;
+
+
+
+create or replace TABLE WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_ROLE_PAT_STATUS (
+      ACTIVE_SERVICE_USER_NAME VARCHAR(16777216) NOT NULL,
+      SF_ROLE VARCHAR(16777216) NOT NULL,
+      OWNER_EMAIL_LIST VARCHAR(16777216),
+      ACCESS_TOKEN_ROTATED_BY VARCHAR(16777216),
+      ACCESS_TOKEN_EXPIRES_ON TIMESTAMP_NTZ(9),
+      ACCESS_TOKEN_UPDATED_ON TIMESTAMP_NTZ(9),
+      DAYS_TO_EXPIRY NUMBER(38,0),
+      EXPIRE_ROTATED_TOKEN_AFTER_HOURS NUMBER(38,0),
+      COMMENTS VARCHAR(16777216),
+      primary key (ACTIVE_SERVICE_USER_NAME, SF_ROLE)
+);
+
+select * from WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_ROLE_PAT_STATUS;
+
+create or replace TABLE WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_KEYPAIR_STATUS (
+      ACTIVE_SERVICE_USER_NAME VARCHAR(16777216) NOT NULL,
+      OWNER_EMAIL_LIST VARCHAR(16777216),
+      KEYPAIR_ROTATED_BY VARCHAR(16777216),
+      KEYPAIR_UPDATED_ON TIMESTAMP_NTZ(9),
+      KEYPAIR_EXPIRES_ON TIMESTAMP_NTZ(9),
+      KEYPAIR_2_UPDATED_ON TIMESTAMP_NTZ(9),
+      KEYPAIR_2_EXPIRES_ON TIMESTAMP_NTZ(9),
+      DAYS_TO_EXPIRY NUMBER(38,0),
+      EXPIRE_ROTATED_KEYPAIR_AFTER_HOURS NUMBER(38,0),
+      COMMENTS VARCHAR(16777216),
+      primary key (ACTIVE_SERVICE_USER_NAME)
+);
+
+
+SELECT * FROM WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_KEYPAIR_STATUS;
+
+SELECT * FROM SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_USERS WHERE GRANTEE_NAME = 'TEST_PAT_USER';
+
+CREATE OR REPLACE PROCEDURE WAV_METADATA.SECURITY.SP_USM_REFRESH_ACTIVE_SERVICE_USERS_TABLES()
+RETURNS VARCHAR
+LANGUAGE SQL
+EXECUTE AS OWNER
+AS '
+BEGIN
+
+    --------------- Step 1: Update ACTIVE_SERVICE_USER_STATUS------------------
+    MERGE INTO WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_STATUS AS TARGET
+    USING (
+        SELECT 
+            NAME AS ACTIVE_SERVICE_USER_NAME
+        FROM SNOWFLAKE.ACCOUNT_USAGE.USERS 
+        WHERE DELETED_ON IS NULL
+        AND TYPE IN (''LEGACY_SERVICE'', ''SERVICE'')
+    ) AS SOURCE
+    ON TARGET.ACTIVE_SERVICE_USER_NAME = SOURCE.ACTIVE_SERVICE_USER_NAME
+    WHEN NOT MATCHED THEN 
+        INSERT (ACTIVE_SERVICE_USER_NAME) 
+        VALUES (SOURCE.ACTIVE_SERVICE_USER_NAME);
+
+    -------------- Step 2: Update ACTIVE_SERVICE_USER_ROLE_PAT_STATUS--------------
+    MERGE INTO WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_ROLE_PAT_STATUS AS TARGET
+    USING (
+        SELECT 
+            ur.GRANTEE_NAME AS ACTIVE_SERVICE_USER_NAME,
+            ur.ROLE AS SF_ROLE
+        FROM SNOWFLAKE.ACCOUNT_USAGE.GRANTS_TO_USERS ur
+        INNER JOIN WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_STATUS asus
+            ON ur.GRANTEE_NAME = asus.ACTIVE_SERVICE_USER_NAME
+            WHERE asus.AUTHENTICATION_TYPE = ''ACCESS TOKEN''
+    ) AS SOURCE
+    ON TARGET.ACTIVE_SERVICE_USER_NAME = SOURCE.ACTIVE_SERVICE_USER_NAME
+       AND TARGET.SF_ROLE = SOURCE.SF_ROLE
+    WHEN NOT MATCHED THEN
+        INSERT (
+            ACTIVE_SERVICE_USER_NAME,
+            SF_ROLE,
+            OWNER_EMAIL_LIST,
+            DAYS_TO_EXPIRY,
+            EXPIRE_ROTATED_TOKEN_AFTER_HOURS,
+            COMMENTS
+        )
+        VALUES (
+            SOURCE.ACTIVE_SERVICE_USER_NAME,
+            SOURCE.SF_ROLE,
+            '''',   -- Default empty
+            15,   -- Default days to expiry
+            0,    -- Default expiry hours
+            ''''    -- Default comment
+        );
+
+    --------------- Step 1: Update ACTIVE_SERVICE_USER_KEYPAIR_STATUS------------------
+    MERGE INTO WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_KEYPAIR_STATUS AS TARGET
+    USING (
+        SELECT 
+            ACTIVE_SERVICE_USER_NAME
+        FROM WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_STATUS 
+        WHERE AUTHENTICATION_TYPE = ''KEY PAIR''
+    ) AS SOURCE
+    ON TARGET.ACTIVE_SERVICE_USER_NAME = SOURCE.ACTIVE_SERVICE_USER_NAME
+    WHEN NOT MATCHED THEN 
+        INSERT (
+            ACTIVE_SERVICE_USER_NAME,
+            OWNER_EMAIL_LIST,
+            DAYS_TO_EXPIRY,
+            EXPIRE_ROTATED_KEYPAIR_AFTER_HOURS,
+            COMMENTS
+        )
+        VALUES (
+            SOURCE.ACTIVE_SERVICE_USER_NAME,
+            '''',   -- Default empty
+            15,   -- Default days to expiry
+            1,    -- Default expiry hours
+            ''''    -- Default comment
+        );
+
+    RETURN ''Active Service User parent table, Active Service User using PATs and Key Pairs child tables refreshed successfully.'';
+
+END
+';
+
+
+CALL WAV_METADATA.SECURITY.SP_USM_REFRESH_ACTIVE_SERVICE_USERS_TABLES();
+
+
+
+create or replace task WAV_METADATA.SECURITY.TASK_USM_SP_REFRESH_ACTIVE_SERVICE_USERS_TABLES
+      warehouse=PRACTICEWH
+      schedule='USING CRON 0 0 * * * UTC'
+      as CALL WAV_METADATA.SECURITY.SP_USM_REFRESH_ACTIVE_SERVICE_USERS_TABLES();
+
+ALTER TASK WAV_METADATA.SECURITY.TASK_USM_SP_REFRESH_ACTIVE_SERVICE_USERS_TABLES RESUME;
+
+
+
+
+SHOW GRANTS ON SCHEMA WAV_METADATA.SECURITY;
+GRANT CREATE STREAM ON SCHEMA WAV_METADATA.SECURITY TO ROLE USERADMIN;
+
+USE ROLE SYSADMIN;
+USE ROLE USERADMIN;
+
+CREATE OR REPLACE PROCEDURE WAV_METADATA.SECURITY.SP_USM_MANAGE_PAT_LIFECYCLE("USER_NAME" VARCHAR, "ROLE_NAME" VARCHAR)
+RETURNS VARCHAR
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+EXECUTE AS CALLER
+AS ' 
+from datetime import datetime, timedelta 
+ 
+def main(session, USER_NAME, ROLE_NAME): 
+     
+    # Validate inputs 
+    if not USER_NAME or not ROLE_NAME: 
+        return "ERROR: USER_NAME and ROLE_NAME must be provided." 
+        
+
+    # Fetch lifecycle expiry settings from ACTIVE_SERVICE_USER_ROLE_PAT_STATUS 
+    config = session.sql(f'''''' 
+        SELECT DAYS_TO_EXPIRY, EXPIRE_ROTATED_TOKEN_AFTER_HOURS 
+        FROM WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_ROLE_PAT_STATUS 
+        WHERE ACTIVE_SERVICE_USER_NAME = ''{USER_NAME}'' AND SF_ROLE = ''{ROLE_NAME}'' 
+    '''''').collect() 
+
+
+    if not config: 
+        return f"ERROR: No config found for user ''{USER_NAME}'' and role ''{ROLE_NAME}''" 
+
+
+    DAYS_TO_EXPIRY = config[0][''DAYS_TO_EXPIRY''] 
+    EXPIRE_ROTATED_TOKEN_AFTER_HOURS = config[0][''EXPIRE_ROTATED_TOKEN_AFTER_HOURS''] 
+
+    # Step 1: Fetch PATs 
+    tokens = session.sql(f''SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER "{USER_NAME}"'').collect() 
+
+
+    # Step 2: Remove expired tokens 
+    expired = [t[''name''] for t in tokens if t[''role_restriction''] == ROLE_NAME and t[''status''] == ''EXPIRED''] 
+    for name in expired: 
+        try: 
+            session.sql(f''ALTER USER "{USER_NAME}" REMOVE PAT "{name}"'').collect() 
+        except Exception as e: 
+            return f"ERROR removing expired token ''{name}'': {str(e)}" 
+
+
+    # Step 3: Re-fetch tokens 
+    tokens = session.sql(f''SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER "{USER_NAME}"'').collect() 
+    active = [t for t in tokens if t[''role_restriction''] == ROLE_NAME and t[''status''] == ''ACTIVE''] 
+    new_token_name = f"{ROLE_NAME}_TOKEN"
+
+
+    if not active: 
+        # Step 4a: Create new token 
+        try: 
+            result = session.sql( 
+                f''''''ALTER USER "{USER_NAME}" ADD PROGRAMMATIC ACCESS TOKEN "{new_token_name}"  
+                    DAYS_TO_EXPIRY = {DAYS_TO_EXPIRY} ROLE_RESTRICTION = "{ROLE_NAME}"'''''' 
+            ).collect() 
+
+            # Re-fetch tokens to get "expires_at" column details
+            refreshed_tokens = session.sql(f''SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER "{USER_NAME}"'').collect()
+            active_record = [t for t in refreshed_tokens if t[''name''] == new_token_name]
+            expires_at = active_record[0][''expires_at'']
+
+            # Add the access token updated timestamp to ACTIVE_SERVICE_USER_ROLE_PAT_STATUS table 
+            tbl_update = session.sql(f''''''
+                UPDATE WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_ROLE_PAT_STATUS
+                    SET ACCESS_TOKEN_UPDATED_ON = CURRENT_TIMESTAMP(),
+                    ACCESS_TOKEN_ROTATED_BY = CURRENT_USER(),
+                    ACCESS_TOKEN_EXPIRES_ON = TO_TIMESTAMP(''{expires_at}'')
+                    WHERE ACTIVE_SERVICE_USER_NAME = ''{USER_NAME}'' AND SF_ROLE = ''{ROLE_NAME}'';
+            '''''').collect()
+             
+
+            return result[0][''token_secret''] if ''token_secret'' in result[0] else ''ERROR: Token created, but no secret returned.'' 
+        except Exception as e: 
+            return f"ERROR: Failed to create token: {str(e)}" 
+    else: 
+        # Step 4b: Rotate existing token 
+        latest_active_token = max(active, key=lambda t: t[''expires_at''])
+        active_token_name = latest_active_token[''name'']
+        try: 
+            result = session.sql( 
+                f''''''ALTER USER "{USER_NAME}" ROTATE PROGRAMMATIC ACCESS TOKEN "{active_token_name}"  
+                    EXPIRE_ROTATED_TOKEN_AFTER_HOURS = {EXPIRE_ROTATED_TOKEN_AFTER_HOURS}'''''' 
+            ).collect() 
+
+            # Re-fetch tokens to get "expires_at" column details
+            refreshed_tokens = session.sql(f''SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER "{USER_NAME}"'').collect()
+            active_record = [t for t in refreshed_tokens if t[''name''] == active_token_name]
+            expires_at = active_record[0][''expires_at'']
+
+            # Add the access token updated timestamp to ACTIVE_SERVICE_USER_ROLE_PAT_STATUS table 
+            tbl_update = session.sql(f''''''
+                UPDATE WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_ROLE_PAT_STATUS
+                    SET ACCESS_TOKEN_UPDATED_ON = CURRENT_TIMESTAMP(),
+                    ACCESS_TOKEN_ROTATED_BY = CURRENT_USER(),
+                    ACCESS_TOKEN_EXPIRES_ON = TO_TIMESTAMP(''{expires_at}'')
+                    WHERE ACTIVE_SERVICE_USER_NAME = ''{USER_NAME}'' AND SF_ROLE = ''{ROLE_NAME}'';
+            '''''').collect()
+             
+
+            return result[0][''token_secret''] if ''token_secret'' in result[0] else ''ERROR: Token rotated, but no secret returned.'' 
+        except Exception as e: 
+            return f"ERROR: Failed to rotate token: {str(e)}" 
+
+';
+
+CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_PAT_LIFECYCLE('TEST_PAT_USER', 'TEST_PAT_USER_TESTING1_ROLE');
+DESCRIBE USER TEST_PAT_USER;
+SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER "TEST_PAT_USER";
+
+CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_RSA_LIFECYCLE('TEST_RSA_USER');
+DESCRIBE USER TEST_RSA_USER;
+
+
+CREATE OR REPLACE PROCEDURE WAV_METADATA.SECURITY.SP_USM_MANAGE_RSA_LIFECYCLE("USERNAME" STRING)
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('cryptography','snowflake-snowpark-python')
+HANDLER = 'main'
+EXECUTE AS CALLER
+AS $$
+from cryptography.exceptions import InvalidKey 
+from cryptography.hazmat.primitives.asymmetric import rsa 
+from cryptography.hazmat.primitives import serialization 
+from snowflake.snowpark import Session 
+import snowflake.snowpark as snowpark 
+import io 
+import base64 
+import hashlib 
+
+ 
+def generate_rsa_key_pair(session): 
+    try: 
+        # Generate RSA Private Key (4096 bits) 
+        private_key = rsa.generate_private_key( 
+            public_exponent=65537, 
+            key_size=4096 
+        ) 
+     
+        # Extract Public Key 
+        public_key = private_key.public_key() 
+
+
+        # Serialize private key to PEM format 
+        private_key_pem = private_key.private_bytes( 
+            encoding=serialization.Encoding.PEM, 
+            format=serialization.PrivateFormat.PKCS8, 
+            encryption_algorithm=serialization.NoEncryption() 
+        ).decode('utf-8') 
+        # Strip headers and footers 
+        #private_key_stripped = private_key_pem.split(''\\\\n'')[1:-2]  # Remove first and last lines 
+        #private_key_stripped = \\\\n'.join(private_key_stripped) 
+         
+
+        # Serialize public key to PEM format 
+        public_key_pem = public_key.public_bytes( 
+            encoding=serialization.Encoding.PEM, 
+            format=serialization.PublicFormat.SubjectPublicKeyInfo 
+        ).decode('utf-8') 
+        # Strip headers and footers 
+        lines = public_key_pem.strip().splitlines()
+        # Remove first and last lines, then join the rest
+        key_body = [line.strip() for line in lines if not line.startswith("-----")]
+        public_key_stripped = ''.join(key_body)
+
+        return private_key_pem, public_key_stripped
+
+    except Exception as e: 
+        raise Exception(f"RSA Key generation failed: {str(e)}") 
+
+
+def main(session, USERNAME): 
+    if not USERNAME or USERNAME.strip() == '': 
+        return "Error: USERNAME cannot be empty." 
+
+    try: 
+        # Describe the user 
+        desc_user = session.sql(f"DESCRIBE USER IDENTIFIER('{USERNAME}')").collect() 
+    except Exception as e: 
+        return f"Error describing user '{USERNAME}': {str(e)}" 
+
+    if not desc_user: 
+        return f"Error: User '{USERNAME}' does not exist or could not be described." 
+
+ 
+    # Initialize values 
+    rsa_public_key = None 
+    rsa_public_key_2 = None 
+    rsa_public_key_last_set_time = None 
+    rsa_public_key_2_last_set_time = None  
+
+    try: 
+        for row in desc_user: 
+            prop = row['property'] 
+            val = row['value'] 
+
+            if prop == 'RSA_PUBLIC_KEY': 
+                rsa_public_key = val 
+            elif prop == 'RSA_PUBLIC_KEY_2': 
+                rsa_public_key_2 = val 
+            elif prop == 'RSA_PUBLIC_KEY_LAST_SET_TIME': 
+                rsa_public_key_last_set_time = val 
+            elif prop == 'RSA_PUBLIC_KEY_2_LAST_SET_TIME': 
+                rsa_public_key_2_last_set_time = val 
+    except Exception as e: 
+        return f"Error parsing DESCRIBE USER results: {str(e)}" 
+ 
+
+    # Generate RSA keypair 
+    try: 
+        private_key, public_key = generate_rsa_key_pair(session) 
+    except Exception as e: 
+        return str(e) 
+     
+
+    # Update Public key for the user
+    try: 
+        if rsa_public_key:
+            session.sql(f"ALTER USER IDENTIFIER('{USERNAME}') \
+                SET RSA_PUBLIC_KEY_2 = '{rsa_public_key}'").collect()
+
+        session.sql(f"ALTER USER IDENTIFIER('{USERNAME}') \
+            SET RSA_PUBLIC_KEY = '{public_key}'").collect() 
+
+        key_location = 'RSA_PUBLIC_KEY (updated)'
+  
+    except Exception as e: 
+        return f"Error updating RSA key for user '{USERNAME}': {str(e)}" 
+
+    # Add the access token updated timestamp to ACTIVE_SERVICE_USER_KEYPAIR_STATUS table 
+    tbl_update = session.sql(f''' UPDATE WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_KEYPAIR_STATUS SET KEYPAIR_ROTATED_BY = CURRENT_USER(), KEYPAIR_UPDATED_ON = CURRENT_TIMESTAMP(), KEYPAIR_EXPIRES_ON = DATEADD(DAY, DAYS_TO_EXPIRY, CURRENT_TIMESTAMP()), KEYPAIR_2_UPDATED_ON = CURRENT_TIMESTAMP(), KEYPAIR_2_EXPIRES_ON = DATEADD(HOUR, EXPIRE_ROTATED_KEYPAIR_AFTER_HOURS, CURRENT_TIMESTAMP()) WHERE ACTIVE_SERVICE_USER_NAME = '{USERNAME}'; ''').collect()
+    
+    return private_key 
+$$;
+
+
+
+
+
+
+CREATE OR REPLACE PROCEDURE WAV_METADATA.SECURITY.SP_USM_CLEAR_EXPIRED_RSA_KEY2()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+DECLARE
+  expired_users CURSOR FOR
+    SELECT ACTIVE_SERVICE_USER_NAME
+    FROM WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_KEYPAIR_STATUS
+    WHERE CURRENT_TIMESTAMP() >= KEYPAIR_2_EXPIRES_ON;
+
+  row_count NUMBER := 0;
+
+BEGIN
+  FOR record IN expired_users DO
+    EXECUTE IMMEDIATE 
+      'ALTER USER IDENTIFIER('' || record.ACTIVE_SERVICE_USER_NAME || ''') UNSET RSA_PUBLIC_KEY_2';
+    row_count := row_count + 1;
+  END FOR;
+
+  RETURN 'Expired RSA_PUBLIC_KEY_2 keys cleared: ' || row_count;
+END;
+$$;
+
+
+
+
+
+
+
+CREATE OR REPLACE PROCEDURE WAV_METADATA.SECURITY.SP_USM_MANAGE_MASTER_LIFECYCLE("USER_NAME" STRING, "ROLE_NAME" STRING, "SOURCE" STRING, "TYPE" STRING)
+RETURNS STRING
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'main'
+EXECUTE AS CALLER
+AS
+$$
+def main(session, USER_NAME, ROLE_NAME, SOURCE, TYPE):
+    response = ""
+
+    if SOURCE == 'STREAMLIT_APP':
+        gather_details = session.sql(
+            "SELECT USER, ROLE, SESSION_ID, TYPE FROM WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_REQUEST"
+        ).collect()
+
+        if not gather_details:
+            response = "No Streamlit input data found in the request table."
+        else:    
+            for row in gather_details:
+                USER_NAME = row['USER']
+                ROLE_NAME = row['ROLE']
+                SESSION_ID = row['SESSION_ID']
+                TYPE = row['TYPE']
+        
+                if TYPE == 'ACCESS TOKEN':
+                    response = session.sql(f"CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_PAT_LIFECYCLE('{USER_NAME}', '{ROLE_NAME}')").collect()
+                    response = response[0]['SP_USM_MANAGE_PAT_LIFECYCLE']
+                    safe_response = response.replace("'", "''") if response else ''
+        
+                    session.sql(f""" INSERT INTO WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE VALUES ('{USER_NAME}', '{ROLE_NAME}', '{safe_response}', '{SESSION_ID}', '{TYPE}') """).collect()
+                
+                elif TYPE == 'KEY PAIR':
+                    try:
+                        response_out = session.sql(f"CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_RSA_LIFECYCLE('{USER_NAME}')").collect()
+                    except Exception as e:
+                        return f"Failed to call RSA lifecycle procedure for {USER_NAME}: {str(e)}"
+                    response = response_out[0]['SP_USM_MANAGE_RSA_LIFECYCLE']
+                    safe_response = response.replace("'", "''") if response else ''
+        
+                    session.sql(f""" INSERT INTO WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE VALUES ('{USER_NAME}', '{ROLE_NAME}', '{safe_response}', '{SESSION_ID}', '{TYPE}') """).collect()
+
+                else:
+                    response = "Invalid TYPE for STREAMLIT_APP"
+
+    elif SOURCE == 'LAMBDA':
+        if TYPE == 'ACCESS TOKEN':
+            response = session.sql(f"CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_PAT_LIFECYCLE('{USER_NAME}', '{ROLE_NAME}')").collect()
+            response = response[0]['SP_USM_MANAGE_PAT_LIFECYCLE']
+
+        elif TYPE == 'KEY PAIR':
+            response = session.sql(f"CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_RSA_LIFECYCLE('{USER_NAME}')").collect()
+            response = response[0]['SP_USM_MANAGE_RSA_LIFECYCLE']
+
+        else:
+            response = "Invalid TYPE for LAMBDA"
+
+    else:
+        response = "Invalid SOURCE provided to the Master procedure"
+
+    return response
+
+$$;
+
+use role sysadmin;
+CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_MASTER_LIFECYCLE(NULL, NULL, 'STREAMLIT_APP', NULL);
+
+create or replace task WAV_METADATA.SECURITY.TASK_USM_CALL_MASTER_LIFECYCLE
+      warehouse=PRACTICEWH
+      schedule='1 MINUTE'
+      as CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_MASTER_LIFECYCLE(NULL, NULL, 'STREAMLIT_APP', NULL);
+
+EXECUTE TASK WAV_METADATA.SECURITY.TASK_USM_CALL_MASTER_LIFECYCLE;
+
+
+
+
+
+create or replace task WAV_METADATA.SECURITY.TASK_USM_CLEAR_EXPIRED_RSA_KEY2
+      warehouse=PRACTICEWH
+      schedule='1 HOUR'
+      as CALL WAV_METADATA.SECURITY.SP_USM_CLEAR_EXPIRED_RSA_KEY2();
+
+
+
+
+create or replace TRANSIENT TABLE WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE (
+      USER VARCHAR(16777216),
+      ROLE VARCHAR(16777216),
+      TOKEN VARCHAR(16777216),
+      SESSION_ID VARCHAR(16777216),
+      TYPE VARCHAR(16777216)
+);
+
+
+
+create or replace TRANSIENT TABLE WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_REQUEST (
+      USER VARCHAR(16777216),
+      ROLE VARCHAR(16777216),
+      SESSION_ID VARCHAR(16777216),
+      TYPE VARCHAR(16777216)
+);
+
+
+create or replace stream WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE_STREAM on table WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE append_only = true;
+GRANT SELECT ON STREAM WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE_STREAM TO ROLE SYSADMIN;
+show grants on stream WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE_STREAM;
+
+show grants on role SYSADMIN;
+
+
+
+
+
+
+------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+
+
+CREATE USER TEST_PAT_USER
+  PASSWORD = 'StrongPassword!123'
+  DEFAULT_ROLE = WAV_ANALYST
+  DEFAULT_WAREHOUSE = PRACTICEWH
+  MUST_CHANGE_PASSWORD = TRUE;
+
+DESCRIBE USER "TEST_PAT_USER";
+CREATE AUTHENTICATION POLICY my_authentication_policy
+  PAT_POLICY=(
+    NETWORK_POLICY_EVALUATION = ENFORCED_NOT_REQUIRED
+  );
+
+
+CREATE USER TEST_RSA_USER
+  PASSWORD = 'StrongPassword!123'
+  DEFAULT_ROLE = WAV_ANALYST
+  DEFAULT_WAREHOUSE = PRACTICEWH
+  MUST_CHANGE_PASSWORD = TRUE;
+
+
+
+CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_RSA_LIFECYCLE('TEST_RSA_USER');
+DESCRIBE USER TEST_RSA_USER;
+
+
+
+CREATE OR REPLACE PROCEDURE WAV_METADATA.SECURITY.GENERATE_RSA_KEYPAIR()
+RETURNS VARCHAR
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('cryptography','snowflake-snowpark-python')
+HANDLER = 'main'
+EXECUTE AS CALLER
+AS ' 
+from cryptography.exceptions import InvalidKey 
+from cryptography.hazmat.primitives.asymmetric import rsa 
+from cryptography.hazmat.primitives import serialization 
+from snowflake.snowpark import Session 
+import snowflake.snowpark as snowpark 
+import io 
+import base64 
+import hashlib 
+
+ 
+def main(session: snowpark.Session) -> str: 
+    try: 
+        # Generate RSA Private Key (4096 bits) 
+        private_key = rsa.generate_private_key( 
+            public_exponent=65537, 
+            key_size=4096 
+        ) 
+     
+        # Extract Public Key 
+        public_key = private_key.public_key() 
+
+
+        # Serialize private key to PEM format 
+        private_key_pem = private_key.private_bytes( 
+            encoding=serialization.Encoding.PEM, 
+            format=serialization.PrivateFormat.PKCS8, 
+            encryption_algorithm=serialization.NoEncryption() 
+        ).decode(''utf-8'') 
+        # Strip headers and footers 
+        #private_key_stripped = private_key_pem.split(''''\\\\n'''')[1:-2]  # Remove first and last lines 
+        #private_key_stripped = ''\\\\n''.join(private_key_stripped) 
+         
+
+        # Serialize public key to PEM format 
+        public_key_pem = public_key.public_bytes( 
+            encoding=serialization.Encoding.PEM, 
+            format=serialization.PublicFormat.SubjectPublicKeyInfo 
+        ).decode(''utf-8'') 
+        # Strip headers and footers 
+        lines = public_key_pem.strip().splitlines()
+        # Remove first and last lines, then join the rest
+        key_body = [line.strip() for line in lines if not line.startswith("-----")]
+        public_key_stripped = ''''.join(key_body)
+
+        return public_key_stripped
+
+    except Exception as e: 
+        raise Exception(f"RSA Key generation failed: {str(e)}") 
+';
+
+CALL WAV_METADATA.SECURITY.GENERATE_RSA_KEYPAIR();
+
+select * FROM WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_REQUEST;
+select * FROM WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE;
+
+-- DELETE FROM WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_REQUEST;
+-- DELETE FROM WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE;
+
+CALL WAV_METADATA.SECURITY.SP_USM_MANAGE_MASTER_LIFECYCLE(NULL, NULL, 'STREAMLIT_APP', NULL);
+
+EXECUTE TASK WAV_METADATA.SECURITY.TASK_USM_CALL_MASTER_LIFECYCLE;
+
+
+
+SELECT * FROM WAV_METADATA.SECURITY.USM_CREDENTIAL_ROTATION_STAGING_RESPONSE_STREAM;
+
+
+
+SHOW TASKS LIKE 'TASK_USM_CALL_MASTER_LIFECYCLE';
+SHOW GRANTS TO ROLE SYSADMIN;
+
+GRANT USAGE ON PROCEDURE  WAV_METADATA.SECURITY.SP_USM_MANAGE_PAT_LIFECYCLE(STRING, STRING) TO ROLE SYSADMIN;
+grant EXECUTE TASK on account to role SYSADMIN;
+
+
+
+
+GRANT USAGE ON DATABASE WAV_METADATA TO ROLE USERADMIN;
+GRANT USAGE ON SCHEMA WAV_METADATA.SECURITY TO ROLE USERADMIN;
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLE WAV_METADATA.SECURITY.USM_ACTIVE_SERVICE_USER_KEYPAIR_STATUS TO ROLE USERADMIN;
+GRANT USAGE ON WAREHOUSE PRACTICEWH TO ROLE USERADMIN;
+
+use role accountadmin;
+GRANT EXECUTE TASK ON ALL TASKS IN SCHEMA WAV_METADATA.SECURITY TO ROLE USERADMIN;
+
+
+
+use role useradmin;
+GRANT OWNERSHIP ON PROCEDURE WAV_METADATA.SECURITY.SP_USM_MANAGE_PAT_LIFECYCLE(VARCHAR, VARCHAR) TO SYSADMIN COPY CURRENT GRANTS;
+
+
+use role sysadmin;
+DESCRIBE USER "TEST_RSA_USER";
+SHOW USER PROGRAMMATIC ACCESS TOKENS FOR USER "TEST_PAT_USER";
+-- GRANT OWNERSHIP ON USER "TEST_PAT_USER" TO ROLE SYSADMIN COPY CURRENT GRANTS;
+
+
+
+CREATE TABLE IF NOT EXISTS WAV_METADATA.SECURITY.ERROR_LOGS (
+    PROCEDURE_NAME STRING,
+    ERROR_TIMESTAMP TIMESTAMP,
+    ERROR_MESSAGE STRING
+);
+
+SELECT * FROM WAV_METADATA.SECURITY.ERROR_LOGS;
+
+
+
+SELECT *
+FROM TABLE(WAV_METADATA.INFORMATION_SCHEMA.TASK_HISTORY(
+    scheduled_time_range_start=>DATEADD('hour', -1, CURRENT_TIMESTAMP()),
+    result_limit=>10
+))
+WHERE name = 'TASK_USM_CALL_MASTER_LIFECYCLE'
+ORDER BY scheduled_time DESC;
